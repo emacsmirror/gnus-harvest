@@ -34,9 +34,8 @@
 ;;     '(progn (require 'gnus-harvest)
 ;;             (gnus-harvest-install)))
 ;;
-;; If you use message-x and ido, you can get TAB completion of harvested
-;; address in your To:, Cc: and From: fields by using this instead of the
-;; above:
+;; If you use message-x, you can get TAB completion of harvested address in
+;; your To:, Cc: and From: fields by using this instead of the above:
 ;;
 ;;   (eval-after-load "gnus"
 ;;     '(progn (require 'gnus-harvest)
@@ -49,9 +48,7 @@
 (require 'message)
 (require 'bbdb nil t)
 (require 'bbdb-com nil t)
-
-(eval-when-compile
-  (require 'cl))
+(require 'cl-lib)
 
 (defgroup gnus-harvest nil
   "Harvest addresses from Gnus articles and messages"
@@ -86,6 +83,11 @@
   "If non-nil, look for net addresses in the user's BBDB records.
 If you want to complete based on the `mail-alias' field, see the
 function `bbdb-mail-aliases'."
+  :type 'boolean
+  :group 'gnus-harvest)
+
+(defcustom gnus-harvest-search-in-org-contacts (featurep 'org-contacts)
+  "If non-nil, look for net addresses in the user's Org-contacts records."
   :type 'boolean
   :group 'gnus-harvest)
 
@@ -167,10 +169,18 @@ CREATE INDEX IF NOT EXISTS fullname_idx on addrs (fullname)" t)
 CREATE INDEX IF NOT EXISTS last_seen_idx on addrs (last_seen)" t))
 
 (defun gnus-harvest-complete-stub (stub &optional prefix-only-p)
-  (let ((addrs
-         (read (concat "("
-                       (gnus-harvest-sqlite-invoke
-                        (format "
+  (let* ((where-clause
+          (format "
+        WHERE
+            (email LIKE '%s%s%%' OR fullname LIKE '%s%s%%')
+"
+                  (if prefix-only-p "" "%") stub
+                  (if prefix-only-p "" "%") stub))
+         (addrs
+          (read
+           (concat "("
+                   (gnus-harvest-sqlite-invoke
+                    (format "
 SELECT
     '(\"' ||
     CASE
@@ -191,18 +201,19 @@ FROM
             email, respond_email, fullname, last_seen, weight
         FROM
             addrs
-        WHERE
-            (email LIKE '%s%s%%' OR fullname LIKE '%s%s%%')
+        %s
         ORDER BY
             weight DESC,
             last_seen DESC
         LIMIT
             %d
     )"
-                                (if prefix-only-p "" "%") stub
-                                (if prefix-only-p "" "%") stub
-                                gnus-harvest-query-limit))
-                       ")"))))
+                            (if (and stub
+                                     (> (length stub) 0))
+                                where-clause
+                              "")
+                            gnus-harvest-query-limit))
+                   ")"))))
     addrs))
 
 (defun gnus-harvest-mailalias-complete-stub (stub)
@@ -230,10 +241,10 @@ FROM
                       mail-aliases)))))
 
 (defun gnus-harvest-bbdb-complete-stub (stub)
-  (loop for record in (bbdb-search (bbdb-records) stub nil stub)
-        for nets = (bbdb-record-mail record)
-        when nets
-        collect (format "%s <%s>" (bbdb-record-name record) (car nets))))
+  (cl-loop for record in (bbdb-search (bbdb-records) stub nil stub)
+           for nets = (bbdb-record-mail record)
+           when nets
+           collect (format "%s <%s>" (bbdb-record-name record) (car nets))))
 
 (defun gnus-harvest-insert-address (email respond-email fullname moment weight)
   (insert
@@ -262,7 +273,7 @@ VALUES
   ;; buffer.
   (when (derived-mode-p 'gnus-summary-mode)
     (set-buffer gnus-article-buffer))
-  
+
   (let ((tmp-buf (generate-new-buffer "*gnus harvest*"))
         (moment (number-to-string (floor (float-time))))
         (email-list
@@ -342,7 +353,7 @@ VALUES
                            (delete stub (mapcar #'car addrs)))))
             (cond
              ((> (length aliases) 1)
-              (ido-completing-read "Use address: " aliases nil t stub))
+              (completing-read "Use address: " aliases nil t stub))
              ((= (length aliases) 1)
               (car aliases))
              (t
@@ -356,6 +367,65 @@ VALUES
     (if (and gnus-harvest-move-to-subject-after-match
              (null (message-field-value "subject")))
         (message-goto-subject))))
+
+(defun gnus-harvest-org-contacts-complete-name (string)
+  "Complete text at START with a user name and email."
+  (let* ((completion-ignore-case org-contacts-completion-ignore-case)
+         (completion-list
+          (cl-loop for contact in (org-contacts-filter)
+                   ;; The contact name is always the car of the assoc-list
+                   ;; returned by `org-contacts-filter'.
+                   for contact-name = (car contact)
+
+                   ;; Build the list of the email addresses which has
+                   ;; been expired
+                   for ignore-list = (org-contacts-split-property
+                                      (or (cdr (assoc-string org-contacts-ignore-property
+                                                             (nth 2 contact))) ""))
+                   ;; Build the list of the user email addresses.
+                   for email-list = (org-contacts-remove-ignored-property-values
+                                     ignore-list
+                                     (org-contacts-split-property
+                                      (or (cdr (assoc-string org-contacts-email-property
+                                                             (nth 2 contact))) "")))
+                   ;; If the user has email addresses…
+                   if email-list
+                   ;; … append a list of USER <EMAIL>.
+                   nconc (cl-loop for email in email-list
+                                  collect (org-contacts-format-email
+                                           contact-name (org-contacts-strip-link email))))))
+    (org-contacts-all-completions-prefix
+     string
+     (org-uniquify
+      (append (mapcar #'car (gnus-harvest-complete-stub
+                             string gnus-harvest-match-by-prefix))
+              completion-list)))))
+
+(defun gnus-harvest-capf ()
+  (save-excursion
+    (let ((end (point)))
+      (goto-char (line-beginning-position))
+      (while (looking-at "[A-Z][a-z]+:")
+        (goto-char (match-end 0)))
+      (skip-syntax-forward " ")
+      (list (point) end
+            (completion-table-dynamic
+             #'gnus-harvest-org-contacts-complete-name)
+            ;; (completion-table-dynamic
+            ;;  #'(lambda (stub)
+            ;;      (let ((addrs (and gnus-harvest-search-in-bbdb
+            ;;                        (gnus-harvest-bbdb-complete-stub stub))))
+            ;;        (if (stringp addrs) (list addrs) addrs))))
+            ;; (completion-table-dynamic
+            ;;  #'(lambda (stub)
+            ;;      (let ((addrs (gnus-harvest-mailalias-complete-stub stub)))
+            ;;        (if (stringp addrs) (list addrs) addrs))))
+
+            ))))
+
+;;;###autoload
+(defun gnus-harvest-setup-completion-at-point ()
+  (setq completion-at-point-functions '(gnus-harvest-capf)))
 
 ;;;###autoload
 (defun gnus-harvest-install (&rest features)
